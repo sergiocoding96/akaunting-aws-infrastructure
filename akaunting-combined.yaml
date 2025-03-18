@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Akaunting deployment - Single server (Free Tier Compatible)'
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0261755bbcb8c4a84
+    us-west-2:
+      AMI: ami-0735c191cf914754d
+    eu-west-1:
+      AMI: ami-0694d931cee176e7d
+
+Parameters:
+  DBPassword:
+    Type: String
+    Description: Database root password
+    NoEcho: true
+    MinLength: 8
+  EnvironmentType:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment type for resource configuration
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+Resources:
+  # VPC Resources
+  AkauntingVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-vpc-${EnvironmentType}
+        - Key: Environment
+          Value: !Ref EnvironmentType
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AkauntingVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-public-subnet-${EnvironmentType}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-igw-${EnvironmentType}
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AkauntingVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AkauntingVPC
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-public-rt-${EnvironmentType}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Akaunting EC2 instance
+      VpcId: !Ref AkauntingVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-web-sg-${EnvironmentType}
+
+  # IAM Role for EC2
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-ec2-role-${EnvironmentType}
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref WebServerRole
+
+  # EC2 Instance
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-server-${EnvironmentType}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          # Update system
+          yum update -y
+          
+          # Install Apache, PHP, and MariaDB
+          amazon-linux-extras enable php7.4
+          yum clean metadata
+          yum install -y httpd mariadb-server php php-mysqlnd php-gd php-curl php-zip php-imap php-xml php-mbstring unzip wget
+          
+          # Start services
+          systemctl start httpd
+          systemctl enable httpd
+          systemctl start mariadb
+          systemctl enable mariadb
+          
+          # Configure MariaDB with secure installation
+          mysql -e "UPDATE mysql.user SET Password=PASSWORD('${DBPassword}') WHERE User='root';"
+          mysql -e "DELETE FROM mysql.user WHERE User='';"
+          mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
+          mysql -e "DROP DATABASE IF EXISTS test;"
+          mysql -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
+          mysql -e "FLUSH PRIVILEGES;"
+          
+          # Create database for Akaunting
+          mysql -e "CREATE DATABASE akaunting CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+          mysql -e "CREATE USER 'akaunting'@'localhost' IDENTIFIED BY '${DBPassword}';"
+          mysql -e "GRANT ALL PRIVILEGES ON akaunting.* TO 'akaunting'@'localhost';"
+          mysql -e "FLUSH PRIVILEGES;"
+          
+          # Install Akaunting
+          cd /var/www/html
+          wget https://akaunting.com/download.php?version=latest -O akaunting.zip
+          unzip akaunting.zip
+          
+          # Set permissions
+          chown -R apache:apache /var/www/html
+          chmod -R 755 /var/www/html
+          
+          # Configure PHP
+          sed -i 's/memory_limit = 128M/memory_limit = 256M/' /etc/php.ini
+          
+          # Configure Apache
+          cat > /etc/httpd/conf.d/akaunting.conf << 'EOL'
+          <VirtualHost *:80>
+              DocumentRoot /var/www/html
+              <Directory /var/www/html>
+                  Options Indexes FollowSymLinks
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+              ErrorLog /var/log/httpd/akaunting-error.log
+              CustomLog /var/log/httpd/akaunting-access.log combined
+          </VirtualHost>
+          EOL
+          
+          # Restart Apache to apply changes
+          systemctl restart httpd
+          
+          # Create a file to indicate completion
+          echo "Akaunting installation complete $(date)" > /var/www/html/install_complete.txt
+
+  # Elastic IP
+  WebServerEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref WebServer
+      Tags:
+        - Key: Name
+          Value: !Sub akaunting-eip-${EnvironmentType}
+
+Outputs:
+  WebsiteURL:
+    Description: Public URL of the Akaunting installation
+    Value: !Sub http://${WebServerEIP}
+
+  SSHAccess:
+    Description: SSH access to the instance
+    Value: !Sub ssh ec2-user@${WebServerEIP}
+
+  DatabaseInfo:
+    Description: Database credentials (stored on the EC2 instance)
+    Value: "Host: localhost, DB: akaunting, User: akaunting, Password: (same as provided)"
